@@ -1,0 +1,536 @@
+#|
+  transit-analysis.arr 
+|#
+
+# Import useful packages
+include tables
+include shared-gdrive("cs111-2020.arr", "1imMXJxpNWFCUaawtzIJzPhbDuaLHtuDX")
+include gdrive-sheets
+include image
+import math as M
+import statistics as S
+import data-source as DS
+
+include shared-gdrive("taxi-project-support-2020.arr", 
+  "1RF7AvfRpZ6a4asxQzHeC_2a91gNrZtgF")
+
+# Import tables
+taxi-ssid = "1ZbiTAuBpy55akMtA-gWjRBBW0Jo6EP0h_mQWmLMyfkc" 
+taxi-sheet = load-spreadsheet(taxi-ssid) # load spreadsheet
+taxi-data-sheet = taxi-sheet.sheet-by-name("data", true) # get data sheet
+taxi-data-long =
+  load-table:
+    day, weekday, timeframe, num-rides, avg-dist, total-fare
+    source: taxi-data-sheet
+    sanitize num-rides using DS.strict-num-sanitizer
+    sanitize avg-dist using DS.strict-num-sanitizer
+    sanitize total-fare using DS.strict-num-sanitizer
+  end
+
+weather-ssid = "1uiWXHjKAeZ7aUjiL6V_IFN5j9uLRHv_b1ji_Nc3IZm4" 
+wdata-sheet = load-spreadsheet(weather-ssid)
+weather-data =
+  load-table: date, weekday, awnd, prcp, snow, tavg, tmax, tmin
+    source: wdata-sheet.sheet-by-name("final2", true)
+  end
+
+# ------------ Creating a function to merge tables based on dates ------------ #
+
+# Test tables
+ex-taxi = table: day :: String, timeframe :: String, num-rides :: Number
+  row: "01/02/2016", "0-6", 1000
+  row: "01/03/2016", "0-6", 100
+  row: "01/03/2016", "6-12", 10
+  row: "01/04/2016", "18-24", 1
+  row: "01/12/2016", "18-24", 10000 
+  row: "01/17/2016", "12-18", 1000
+end
+
+ex-weather = table: date :: String, prcp :: Number, snow :: Number
+  row: "2016-01-02", 0, 0
+  row: "2016-01-03", 0.5, 0
+  row: "2016-01-04", 0, 0.5
+  row: "2016-01-05", 0.2, 0.03
+  row: "2016-01-06", 0, 3
+  row: "2016-01-12", 5, 2
+  row: "2016-01-13", 0, 0
+  row: "2016-01-17", 0, 0
+end
+
+# Test tables for testing 
+# Shorter similar versions of taxi-data-long and weather-data
+ex-taxi-short = table: day :: String, weekday :: String, timeframe :: String, num-rides :: Number,
+  avg-dist :: Number, total-fare :: Number
+  row: "01/02/2016", "Saturday", "0-6", 1000, 3, 7000
+  row: "01/02/2016", "Saturday", "6-12", 2000, 2, 32400
+  row: "01/02/2016", "Saturday", "12-18", 3000, 5, 234200
+  row: "01/02/2016", "Saturday", "18-24", 1000, 2, 2420
+  row: "01/03/2016", "Sunday", "0-6", 320, 2, 5390
+  row: "01/03/2016", "Sunday", "6-12", 3400, 5, 23400
+  row: "01/03/2016", "Sunday", "12-18", 9000, 8, 78500
+  row: "01/03/2016", "Sunday", "18-24", 2000, 2, 10000
+  row: "01/04/2016", "Monday", "0-6", 56700, 6, 57400
+  row: "01/04/2016", "Monday", "6-12", 23400, 4, 3240
+  row: "01/04/2016", "Monday", "12-18", 23200, 5, 23040
+  row: "01/04/2016", "Monday", "18-24", 2300, 8, 23000
+  row: "01/05/2016", "Tuesday", "0-6", 5500, 1, 10000
+  row: "01/05/2016", "Tuesday", "6-12", 5630, 2, 23400
+  row: "01/05/2016", "Tuesday", "12-18", 2300, 1, 9040
+  row: "01/05/2016", "Tuesday", "18-24", 900, 4, 23400
+end
+
+ex-weather-short = table: date :: String, weekday :: String, awnd :: Number, prcp :: Number,
+  snow :: Number, tavg :: Number, tmax :: Number, tmin :: Number
+  row: "2016-01-02", "Saturday", 12.53, 0, 0, 75, 78, 72
+  row: "2016-01-03", "Sunday", 12.08, 1.2, 0, 65, 70, 60
+  row: "2016-01-04", "Monday", 17.32, 0, 0.5, 30, 40, 20
+  row: "2016-01-05", "Tuesday", 23.33, 0.2, 0.3, 32, 35, 29
+  row: "2016-01-05", "Wednesday", 17.99, 0, 0, 45, 46, 44
+end
+
+# Helper function to change date formats
+fun set-date-format(date :: String) -> String:
+  doc: ```
+       Description: Change the date format from yyyy-mm-dd and mm/dd/yyyy to mm-dd-yyyy 
+       input:
+       - date: a String
+       output: a String
+       ```
+  if string-contains(date, "/"):
+    string-replace(date, "/", "-")
+  else if string-index-of(date, "-") == 4:
+    year = string-substring(date, 0, 4)
+    month = string-substring(date, 5, 7)
+    day = string-substring(date, 8, 10)
+    month + "-" + day + "-" + year
+  else if string-index-of(date, "-") == 2:
+    date
+  else:
+    raise("Invalid date format")
+  end
+where:
+  set-date-format("2016-01-04") is "01-04-2016"
+  set-date-format("01/01/2000") is "01-01-2000"
+  set-date-format("093482930") raises "Invalid date format"
+  set-date-format("01-01-2000") is "01-01-2000"
+end
+
+# Main function
+fun merge-tables(table1 :: Table, table2 :: Table) -> Table:
+  doc:```
+      Description: Merges two tables on the "day" column where table1 contains a "day" column 
+      like taxi-data-long, and table2 contains a "date" column like weather-data. The output
+      is a Table similar to table1 where two columns, rain and snow, are added at the end
+      inputs:
+      - table1: a Table like taxi-data-long
+      - table2: a Table like weather-data
+      output: a Table
+      ```
+  fun get-weather-value(row :: Row, col :: String) -> Number:
+    doc: ```
+         Description: get the "col" value from a particular row given a table "table2"
+         Used ideally with weather types (snow, rain)
+         inputs:
+         - row: a Row
+         - col: the Weather type, a String
+         output: a Number
+         ```
+    weather-modified = transform-column(table2, "date", set-date-format) # weather-data table
+    date = row["day"]
+    weather-row = filter-with(weather-modified, lam(r :: Row) -> Boolean:
+      r["date"] == date end)
+    weather-row.row-n(0)[col]
+  end
+  table1-date = transform-column(table1, "day", set-date-format)
+  rain-table = build-column(table1-date, "rain", lam(r :: Row) -> Number:
+    get-weather-value(r, "prcp") end)
+  build-column(rain-table, "snow", lam(r :: Row) -> Number:
+    get-weather-value(r, "snow") end)
+where:
+  merge-tables(ex-taxi, ex-weather) is
+  table: day :: String, timeframe :: String, num-rides :: Number, rain :: Number, snow :: Number
+    row: "01-02-2016", "0-6", 1000, 0, 0
+    row: "01-03-2016", "0-6", 100, 0.5, 0
+    row: "01-03-2016", "6-12", 10, 0.5, 0
+    row: "01-04-2016", "18-24", 1, 0, 0.5
+    row: "01-12-2016", "18-24", 10000, 5, 2 
+    row: "01-17-2016", "12-18", 1000, 0, 0
+  end
+  merge-tables(ex-taxi-short, ex-weather-short) is
+  table: day :: String, weekday :: String, timeframe :: String, num-rides :: Number,
+    avg-dist :: Number, total-fare :: Number, rain :: Number, snow :: Number
+    row: "01-02-2016", "Saturday", "0-6", 1000, 3, 7000, 0, 0
+    row: "01-02-2016", "Saturday", "6-12", 2000, 2, 32400, 0, 0
+    row: "01-02-2016", "Saturday", "12-18", 3000, 5, 234200, 0, 0
+    row: "01-02-2016", "Saturday", "18-24", 1000, 2, 2420, 0, 0
+    row: "01-03-2016", "Sunday", "0-6", 320, 2, 5390, 1.2, 0
+    row: "01-03-2016", "Sunday", "6-12", 3400, 5, 23400, 1.2, 0
+    row: "01-03-2016", "Sunday", "12-18", 9000, 8, 78500, 1.2, 0
+    row: "01-03-2016", "Sunday", "18-24", 2000, 2, 10000, 1.2, 0
+    row: "01-04-2016", "Monday", "0-6", 56700, 6, 57400, 0, 0.5
+    row: "01-04-2016", "Monday", "6-12", 23400, 4, 3240, 0, 0.5
+    row: "01-04-2016", "Monday", "12-18", 23200, 5, 23040, 0, 0.5
+    row: "01-04-2016", "Monday", "18-24", 2300, 8, 23000, 0, 0.5
+    row: "01-05-2016", "Tuesday", "0-6", 5500, 1, 10000, 0.2, 0.3
+    row: "01-05-2016", "Tuesday", "6-12", 5630, 2, 23400, 0.2, 0.3
+    row: "01-05-2016", "Tuesday", "12-18", 2300, 1, 9040, 0.2, 0.3
+    row: "01-05-2016", "Tuesday", "18-24", 900, 4, 23400, 0.2, 0.3
+  end
+end
+
+
+# ------------ Creating the summary-table function ------------ #
+
+# Test table for testing
+ex-merged-table = merge-tables(ex-taxi, ex-weather) 
+merged-data-short = merge-tables(ex-taxi-short, ex-weather-short)
+
+# Test table where there is only rainy and clear days
+rainy-taxi-data = table: day :: String, weekday :: String, timeframe :: String, num-rides :: Number,
+  avg-dist :: Number, total-fare :: Number, rain :: Number, snow :: Number
+  row: "02-01-2016", "Monday", "0-6", 1000, 4.2, 1000, 5, 0
+  row: "02-01-2016", "Monday", "6-12", 2000, 2.2, 1330, 5, 0
+  row: "02-01-2016", "Monday", "12-18", 3000, 3.7, 8000, 5, 0
+  row: "02-01-2016", "Monday", "18-24", 1000, 1.2, 1430, 5, 0
+  row: "02-02-2016", "Tuesday", "0-6", 20000, 8.3, 234000, 0, 0
+  row: "02-02-2016", "Tuesday", "6-12", 10000, 5.3, 23400, 0, 0
+  row: "02-02-2016", "Tuesday", "12-18", 624000, 3.3, 221100, 0, 0
+  row: "02-02-2016", "Tuesday", "18-24", 102300, 10.3, 237600, 0, 0
+  row: "02-03-2016", "Wednesday", "0-6", 23400, 3.4, 10000, 2, 0
+  row: "02-03-2016", "Wednesday", "6-12", 22200, 7.4, 13420, 2, 0
+  row: "02-03-2016", "Wednesday", "12-18", 84900, 3.2, 167000, 2, 0
+  row: "02-03-2016", "Wednesday", "18-24", 2000, 32.5, 9000, 2, 0
+end
+
+# Helper functions
+fun filter-weather(t :: Table, weather :: String) -> Table:
+  doc: ```
+       Description: Filter the table by the weather type. Rain is when the "rain" column > 0 and
+       "snow" column equals 0, snow is when the "snow" column > 0, and clear is when 
+       the "rain" and "snow" columns are 0
+       inputs:
+       - t: a Table
+       - weather: a String, weather type
+       output: a Table filtered by the weather type
+       ```
+  if weather == "rain":
+    filter-with(t, lam(r):
+      (r["rain"] > 0) and (r["snow"] == 0) end)
+  else if weather == "snow":
+    filter-with(t, lam(r):
+      r["snow"] > 0 end)
+  else if weather == "clear":
+    filter-with(t, lam(r):
+      (r["rain"] == 0) and (r["snow"] == 0) end)
+  else:
+    raise("Invalid weather type")
+  end
+where:
+  filter-weather(ex-merged-table, "rain") is 
+  table: day :: String, timeframe :: String, num-rides :: Number, rain :: Number, snow :: Number
+    row: "01-03-2016", "0-6", 100, 0.5, 0
+    row: "01-03-2016", "6-12", 10, 0.5, 0
+  end
+  filter-weather(ex-merged-table, "clear") is 
+  table: day :: String, timeframe :: String, num-rides :: Number, rain :: Number, snow :: Number
+    row: "01-02-2016", "0-6", 1000, 0, 0
+    row: "01-17-2016", "12-18", 1000, 0, 0
+  end
+  filter-weather(merged-data-short, "snow") is
+  table: day :: String, weekday :: String, timeframe :: String, num-rides :: Number,
+    avg-dist :: Number, total-fare :: Number, rain :: Number, snow :: Number
+    row: "01-04-2016", "Monday", "0-6", 56700, 6, 57400, 0, 0.5
+    row: "01-04-2016", "Monday", "6-12", 23400, 4, 3240, 0, 0.5
+    row: "01-04-2016", "Monday", "12-18", 23200, 5, 23040, 0, 0.5
+    row: "01-04-2016", "Monday", "18-24", 2300, 8, 23000, 0, 0.5
+    row: "01-05-2016", "Tuesday", "0-6", 5500, 1, 10000, 0.2, 0.3
+    row: "01-05-2016", "Tuesday", "6-12", 5630, 2, 23400, 0.2, 0.3
+    row: "01-05-2016", "Tuesday", "12-18", 2300, 1, 9040, 0.2, 0.3
+    row: "01-05-2016", "Tuesday", "18-24", 900, 4, 23400, 0.2, 0.3
+  end
+  filter-weather(merged-data-short, "bad weather") raises "Invalid weather type"
+end
+
+fun filter-time(t :: Table, time :: String) -> Table:
+  doc: ```
+       Description: Given a Table, return the rows where the "timeframe" matches "time"
+       inputs:
+       - t: a Table
+       - time: a String
+       output: a Table
+       ```
+  if time == "0-6":
+    filter-with(t, lam(r):
+      r["timeframe"] == "0-6" end)
+  else if time == "6-12":
+    filter-with(t, lam(r):
+      r["timeframe"] == "6-12" end)
+  else if time == "12-18":
+    filter-with(t, lam(r):
+      r["timeframe"] == "12-18" end)
+  else if time == "18-24":
+    filter-with(t, lam(r):
+      r["timeframe"] == "18-24" end)
+  else: 
+    raise("Invalid")
+  end
+where:
+  filter-time(ex-merged-table, "0-6") is
+  table: day :: String, timeframe :: String, num-rides :: Number, rain :: Number, snow :: Number
+    row: "01-02-2016", "0-6", 1000, 0, 0
+    row: "01-03-2016", "0-6", 100, 0.5, 0
+  end
+  filter-time(ex-merged-table, "18-24") is
+  table: day :: String, timeframe :: String, num-rides :: Number, rain :: Number, snow :: Number
+    row: "01-04-2016", "18-24", 1, 0, 0.5
+    row: "01-12-2016", "18-24", 10000, 5, 2
+  end
+  filter-time(merged-data-short, "18-24") is 
+  table: day :: String, weekday :: String, timeframe :: String, num-rides :: Number,
+    avg-dist :: Number, total-fare :: Number, rain :: Number, snow :: Number
+    row: "01-02-2016", "Saturday", "18-24", 1000, 2, 2420, 0, 0 
+    row: "01-03-2016", "Sunday", "18-24", 2000, 2, 10000, 1.2, 0    
+    row: "01-04-2016", "Monday", "18-24", 2300, 8, 23000, 0, 0.5
+    row: "01-05-2016", "Tuesday", "18-24", 900, 4, 23400, 0.2, 0.3
+  end
+  filter-time(merged-data-short, "1-25") raises "Invalid"
+end
+
+fun time-to-day(time :: String) -> String:
+  doc: ```
+       Description: Converts time ranges ("6-12", "18-24") to time of day ("Morning", "Evening")
+       input:
+       - time: a String
+       output: a String
+       ```
+  if time == "0-6":
+    "Night"
+  else if time == "6-12":
+    "Morning"
+  else if time == "12-18":
+    "Afternoon"
+  else if time == "18-24":
+    "Evening"
+  else:
+    raise("Invalid")
+  end
+where:
+  time-to-day(ex-merged-table.row-n(0)["timeframe"]) is "Night"
+  time-to-day(ex-merged-table.row-n(2)["timeframe"]) is "Morning"
+  time-to-day(ex-merged-table.row-n(3)["timeframe"]) is "Evening"
+  time-to-day(ex-merged-table.row-n(5)["timeframe"]) is "Afternoon"
+  time-to-day("0-10") raises "Invalid"
+end
+
+# Main function
+fun summary-table(t :: Table, f :: (Table, String -> Number)):
+  doc: ```
+       Description: Produces a table that uses the given function f to summarize
+        rides for each of rain/snow/clear weather during morning/
+        afternoon/evening/night timeframes based on the data in the table, t.
+       inputs: 
+       - t: a Table like taxi-join-table
+       - f: a function that takes in a Table and String and returns a Number (mean, sum)
+       output: a Table
+       ```
+  fun build-weather-col(row :: Row, table :: Table, func :: (Table, String -> Number)) -> Number:
+    doc: ```
+         Description: Fill out the values in the summary table produced by summary-table where
+         each value is calculated by the timeframe, weather, and the function "func" on
+         the column "num-rides". If "table" is empty, the Number returned is 0 
+         Note: Running this function without summary-table will do the function "f"
+         for the timeframe given by "row" in the table "table" without any weather filtering
+         inputs: 
+         - row: a Row from a Table which contains the "time" column with values like "0-6", "6-12"
+         - table: a Table like taxi-join-table
+         - func: a Function that takes in a Table and String and returns a Number
+         output: a Number
+         ```
+    if table.length() > 0:
+      func(filter-time(table, row["time"]), "num-rides")
+    else:
+      0
+    end
+  end
+  times = count(t, "timeframe").drop("count")
+  rain = filter-weather(t, "rain")
+  snow = filter-weather(t, "snow")
+  clear = filter-weather(t, "clear")
+  t-timeframe = build-column(times, "time", lam(r :: Row) -> String:
+    r["value"] end).drop("value")
+  t-rain = build-column(t-timeframe, "rain", lam(r :: Row) -> Number:
+    build-weather-col(r, rain, f) end)
+  t-snow = build-column(t-rain, "snow", lam(r :: Row) -> Number:
+    build-weather-col(r, snow, f) end)
+  t-clear = build-column(t-snow, "clear", lam(r :: Row) -> Number:
+    build-weather-col(r, clear, f) end)
+  transform-column(t-clear, "time", time-to-day) 
+where:
+  summary-table(rainy-taxi-data, mean) is
+  table:  time :: String, rain :: Number, snow :: Number, clear :: Number
+    row: "Evening", 1500, 0, 102300
+    row: "Afternoon", 43950, 0, 624000
+    row: "Morning", 12100, 0, 10000
+    row: "Night", 12200, 0, 20000
+  end
+  summary-table(rainy-taxi-data, sum) is
+  table:  time :: String, rain :: Number, snow :: Number, clear :: Number
+    row: "Evening", 3000, 0, 102300
+    row: "Afternoon", 87900, 0, 624000
+    row: "Morning", 24200, 0, 10000
+    row: "Night", 24400, 0, 20000
+  end
+  summary-table(merged-data-short, sum) is
+  table:  time :: String, rain :: Number, snow :: Number, clear :: Number
+    row: "Evening", 2000, 3200, 1000
+    row: "Afternoon", 9000, 25500, 3000
+    row: "Morning", 3400, 29030, 2000
+    row: "Night", 320, 62200, 1000
+  end
+  summary-table(merged-data-short, mean) is
+  table:  time :: String, rain :: Number, snow :: Number, clear :: Number
+    row: "Evening", 2000, 1600, 1000
+    row: "Afternoon", 9000, 12750, 3000
+    row: "Morning", 3400, 14515, 2000
+    row: "Night", 320, 31100, 1000
+  end
+end
+
+
+# ---------------- Analysis Questions Charts --------------------- #
+
+# Merged table for taxi-data-long and weather-data
+# Used for analysis questions 1, 2, 3
+TAXI-JOINT-TABLE = merge-tables(taxi-data-long, weather-data)
+
+# Analysis Question 1
+
+fun weather-check(r :: Row)-> String:
+  doc:```
+      Categorizes the day based on the given weather condition (snow, rain, clear)
+      ```
+  if (r["rain"] > 0) and (r["snow"] == 0) :
+    "rain"
+  else if (r["snow"] > 0) :
+    "snow"
+  else if (r["snow"] == 0) and (r["rain"] == 0):
+    "clear"
+  else:
+    raise("Unknown weather type")
+  end
+where:
+  weather-check(merged-data-short.row-n(0)) is "clear"
+  weather-check(merged-data-short.row-n(4)) is "rain"
+  weather-check(merged-data-short.row-n(8)) is "snow"
+end
+
+fun chart-weather-numrides(table :: Table) -> Image:
+  doc: "Creates a bar chart displaying the number of rides for the different weather conditions"
+  fun add-weather-check-column(t :: Table)-> Table:
+    doc: "Adds a column to 'table' based on the conditions from the function weather-check"
+    build-column(t, "weather-check", weather-check)  
+  end
+  add-weather = add-weather-check-column(table)
+  fun get-average-rides-with-weather(row :: Row)-> Number:
+    doc: "Obtains the mean number of rides for each weather condition"
+    mean(filter-with(add-weather, lam(r): row["value"] == r["weather-check"] end), "num-rides") 
+  end
+  filtered-table-1 = count(add-weather,"weather-check")
+  filtered-table-2 = filtered-table-1.drop("count")
+  rides-table = build-column(filtered-table-2,"average-rides",get-average-rides-with-weather)
+  bar-chart(rides-table, "value", "average-rides")
+end
+
+# Analysis 1 bar chart
+analysis-1-chart = chart-weather-numrides(TAXI-JOINT-TABLE)
+
+
+# Analyis question 2
+
+# Test table for testing helper functions new-rides and new-fares
+analysis-2-days-test = table: value :: String
+  row: "01-02-2016"
+  row: "01-03-2016"
+  row: "01-04-2016"
+  row: "11-25-2000" # Unknown date 
+end
+
+fun new-rides(row :: Row)-> Number:
+  doc: "Filters the number of rides by day and sums it with the TAXI-JOINT-TABLE"
+  sum(filter-with(TAXI-JOINT-TABLE, lam(r): row["value"] == r["day"] end),"num-rides")
+where:
+  new-rides(analysis-2-days-test.row-n(0)) is 345037
+  new-rides(analysis-2-days-test.row-n(1)) is 312831
+  new-rides(analysis-2-days-test.row-n(2)) is 302878
+  new-rides(analysis-2-days-test.row-n(3)) is 0
+end
+
+fun new-fares(row :: Row)-> Number:
+  doc: "Filters the total fares by day and sums them with the TAXI-JOINT-TABLE"
+  sum(filter-with(TAXI-JOINT-TABLE, lam(r): row["value"] == r["day"] end),"total-fare")
+where:
+  new-fares(analysis-2-days-test.row-n(0)) is 4436117.42
+  new-fares(analysis-2-days-test.row-n(1)) is 3889888.11
+  new-fares(analysis-2-days-test.row-n(2)) is 3956068.27
+  new-fares(analysis-2-days-test.row-n(3)) is 0
+end
+
+fun do-boxplot-rides(day:: String, str:: String)-> Image:
+  doc: "Creates a box plot displaying the number of rides for each day"
+  day-table = filter-with(TAXI-JOINT-TABLE, lam(r): r["weekday"] == day end)
+  count-table = count(day-table, "day")
+  day-new-ride = count-table.drop("count")
+  day-rides = build-column(day-new-ride, str, new-rides)
+  box-plot(day-rides, str)
+end
+
+# Charts for analysis 2 (num rides)
+monday-rides-boxplot = do-boxplot-rides("Monday", "Mondays-total-rides")
+tuesday-rides-boxplot = do-boxplot-rides("Tuesday", "Tuesdays-total-rides")
+wednesday-rides-boxplot = do-boxplot-rides("Wednesday", "Wednesdays-total-rides")
+thursday-rides-boxplot = do-boxplot-rides("Thursday", "Thursdays-total-rides")
+friday-rides-boxplot = do-boxplot-rides("Friday", "Fridays-total-rides")
+saturday-rides-boxplot = do-boxplot-rides("Saturday","Saturdays-total-rides")
+sunday-rides-boxplot = do-boxplot-rides("Sunday", "Sundays-total-rides")
+
+fun do-boxplot-fares(day :: String, str :: String)-> Image:
+  doc: "Creates a box plot displaying the total fares for each day"
+  day-table = filter-with(TAXI-JOINT-TABLE, lam(r): r["weekday"] == day end)
+  count-table = count(day-table, "day")
+  day-new-fare = count-table.drop("count")
+  day-fares = build-column(day-new-fare, str, new-fares)
+  box-plot(day-fares, str)
+end
+
+# Charts for analysis 2 (total fares)
+monday-fares-boxplot = do-boxplot-fares("Monday", "Mondays-total-fares")
+tuesday-fares-boxplot = do-boxplot-fares("Tuesday", "Tuesdays-total-fares")
+wednesday-fares-boxplot = do-boxplot-fares("Wednesday", "Wednesdays-total-fares")
+thursday-fares-boxplot = do-boxplot-fares("Thursday", "Thursdays-total-fares")
+friday-fares-boxplot = do-boxplot-fares("Friday", "Fridays-total-fares")
+saturday-fares-boxplot = do-boxplot-fares("Saturday","Saturdays-total-fares")
+sunday-fares-boxplot = do-boxplot-fares("Sunday", "Sundays-total-fares")
+
+
+# Analysis question 3
+
+fun build-bar-chart-for-each-day(table :: Table) -> Image:
+  doc: "Builds 1 bar chart that plots the number of rides for each day of the week"
+  fun get-rides(row :: Row)-> Number:
+    doc: "Gets the number of rides in the row for the specific weekday"
+    sum(filter-with(table, lam(r): row["value"] == r["weekday"] end),"num-rides")
+  end
+  day-count = count(table, "weekday")
+  weekday = day-count.drop("count")
+  per-day-table = build-column(weekday,"total_rides",get-rides)
+  bar-chart(per-day-table,"value","total_rides")
+end
+
+
+# Bar chart for analysis question 3
+
+analysis-3-chart = build-bar-chart-for-each-day(TAXI-JOINT-TABLE)
+
+# Summary Table for TAXI-JOINT-PLOT using mean
+
+summary-table-mean = summary-table(TAXI-JOINT-TABLE, mean)
